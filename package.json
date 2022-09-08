@@ -2,9 +2,12 @@
   "name": "client-inspector",
   "version": "1.0.0",
   "description": "",
-  "main": "main.js",
+  "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "bin": {
+    "inspect-client": "./repl-client.js"
   },
   "author": "",
   "license": "ISC",
