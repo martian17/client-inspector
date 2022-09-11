@@ -4,8 +4,8 @@ const WS = require("ws");
 const WebSocket = WS.WebSocket;
 const WsInterface = require("./ws-interface.js");
 const URL =  require("node:url").URL;
-const repl = require("node:repl");
-
+//const repl = require("node:repl");
+const repl = require('pretty-repl');
 
 
 //server singleton
