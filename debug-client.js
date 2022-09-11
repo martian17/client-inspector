@@ -52,6 +52,16 @@ let safeStringify = function(obj0) {
 
 (async () => {
     const ws = new WebSocket("ws://" + location.host + "/debug/console");
+    ws.awaitOnce = function(type){
+        return new Promise(res=>{
+            let listener = (e)=>{
+                let data = e.data;
+                ws.removeEventListener(type,listener);
+                res(data);
+            };
+            ws.addEventListener(type,listener);
+        });
+    };
     
     let log;
 
@@ -60,28 +70,21 @@ let safeStringify = function(obj0) {
         log = function() {
             let msg = [...arguments];
             console.log(msg, safeStringify(msg));
-            ws.send(safeStringify(msg));
+            ws.send(JSON.stringify(["log",safeStringify(msg)]));
         }
         //log("hello from client");
     });
 
-    let resolver = () => {};
-    // Listen for messages
-    ws.addEventListener('message', (e) => {
-        let code = e.data + "";
-        resolver(code);
-    });
-
     //eval scope
     while (true) {
-        let code = await new Promise(res => {
-            resolver = res;
-        });
+        let code = (await ws.awaitOnce("message")+"").trim();
+        
         try{
-            let result = eval(code)
-            log(result);
+            let result = await eval(`(async ()=>{return ${code}})()`);
+            console.log(code,result);
+            ws.send(JSON.stringify(["return",safeStringify(result)]));
         }catch(err){
-            log(err.toString());
+            ws.send(JSON.stringify(["return",err.toString()]));
         }
     }
 })();

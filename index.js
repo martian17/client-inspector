@@ -3,6 +3,29 @@ const parseUrl = require("parseurl");
 const path = require("path");
 const fsp = require("fs").promises;
 const ws = require("ws");
+const EventEmitter = require('events');
+const WsInterface = require("./ws-interface.js");
+
+class EventTracker{
+    events = [];
+    on(target,type,listener){
+        this.events.push([target,type,listener]);
+        target.on(type,listener);
+        return target;
+    }
+    once(target,type,listener){
+        this.events.push([target,type,listener]);
+        target.once(type,listener);
+        return target;
+    }
+    removeAll(){
+        for(let [target,type,listener] of this.events){
+            target.removeListener(type,listener);
+        }
+        this.events = [];
+    }
+};
+
 
 let skipHTMLComments = function(str,i){
     let c = str[i];
@@ -116,7 +139,7 @@ const createClientList = function(){
         return "No clients are connected at the moment";
     }
     let str = "";
-    str += `active clients at ${Date()}:`;
+    str += `active clients at ${Date()}:\n`;
     for(let key in clients){
         str += ` ${key}: ${clients[key].uagent}`;
     }
@@ -126,40 +149,55 @@ const createClientList = function(){
 
 //Client class: keeps trak of user ws sessions
 let CID = 0;
-class Client{
+class Client extends WsInterface{
     executing = false;
-    constructor(ws,uagent){
-        this.ws = ws;
-        this.uagent = uagent;
-        this.id = ++CID;
-        clients[this.id] = this;
+    constructor(ws){
+        super(ws);
+        this.handshake();
+    }
+    async handshake(){
+        try{
+            let uagent = await this.exec("window.navigator.userAgent");
+            this.uagent = uagent;
+            this.id = ++CID;
+            clients[this.id] = this;
+            console.log(`New client connected: ${uagent}`);
+            console.log(`Connect to this client by opening another terminal, navigate to this directory,`+
+            ` and type "npm exec inspect-client ws://localhost:4002/debug/repl?id=${this.id}"`);
+        }catch(err){
+            console.log("client connected but handshake failed. Please refresh the client.");
+        }
     }
     exec(str){
         let that = this;
         this.executing = true;
-        return new Promise(res=>{
-            this.ws.send(str);
-            this.ws.once("message",(data)=>{
-                //console.log(...JSON.parse(data));
+        this.ws.send(str);
+        return this.awaitOnce("return");
+        return new Promise((res,rej)=>{
+            that.select({
+                "error":(e)=>{
+                    rej(e);
+                },
+                "close":()=>{
+                    rej(new WsInterface.CloseError(
+                        "Connection closed by client mid execution"
+                    ));
+                },
+                "return":(data)=>{
+                    res(data);
+                }
+            });
+        });
+        return new Promise((res,rej)=>{
+            that.once("return",(payload)=>{
                 that.executing = false;
-                res(data+"");
+                res(payload);
             });
         });
     }
-    destroyHooks = new Map();
-    addDestroyHook(hook){
-        this.destroyHooks.set(hook,true);
-        return{
-            remove:()=>{
-                this.destroyHooks.delete(hook);
-            }
-        }
-    }
     destroy(){
+        this.emit("close");
         delete clients[this.id];
-        for(let [hook,_] of this.destroyHooks){
-            hook();
-        }
     }
 };
 
@@ -169,155 +207,100 @@ let createWSS = function(server){
     const wss = new ws.Server({server, path: '/debug/console'});
 
     wss.on('connection', async function connection(ws) {
-        ws.send("window.navigator.userAgent");
-        let uagent = JSON.parse(await new Promise(res=>{
-            ws.once("message",res)[0];
-        }));
-        console.log(`new client connected ${uagent}`);
-        let client = new Client(ws,uagent);
-        
+        let client = new Client(ws);
         ws.once("close",()=>{
             client.destroy();
         });
     });
-    
 }
 
 //initialize repl facing wss
-
-
-//ws module modification
-//bad bad bad
-/*
-{
-    const oldon = ws.WebSocket.prototype.on.bind(ws.WebSocket.prototype);
-    ws.WebSocket.prototype.on = function addListener(type, listener){
-        const target = oldon(type,listener);
-        return {
-            remove:()=>{
-                target.removeListener(type,listener);
+class ReplClient extends WsInterface{
+    constructor(ws){
+        super(ws);
+        let that = this;
+        let client = null;
+        
+        this.on("ls",()=>{
+            that.cmdreturn(createClientList());
+        });
+        this.on("select_client",(arg)=>{
+            let cid = arg.trim();
+            if(cid === ""){
+                that.cmdreturn(`Please provide the client id`);
+            }else if(!(cid in clients)){
+                that.cmdreturn(`client id ${cid} not found`);
+            }else{
+                setClient(clients[cid]);
+                that.cmdreturn(`client ${cid} selected`);
             }
+        });
+        this.on("client_info",()=>{
+            if(client !== null){
+                that.cmdreturn(client.uagent);
+            }else{
+                that.cmdreturn(`no client selected`);
+            }
+        });
+        this.on("exec",async (code)=>{
+            if(client === null){
+                that.cmdreturn("Client not selected. To select a client, "+
+                "first type .ls to get the list of clients, "+
+                "and type .select_client {{id}} to select a client. "+
+                "For more info. Please type .help");
+            }else{
+                that.cmdreturn(
+                    await client.exec(code)
+                    .catch((err)=>{
+                        if(err instanceof WsInterface.CloseError){
+                            return undefined;
+                        }else{
+                            //unknown error
+                            throw err;
+                            process.exit(1);
+                        }
+                    })
+                );
+                
+            }
+        });
+        
+        const events = new EventTracker();
+        let setClient = function(cli){
+            if(client !== null){
+                //cancel the previous log events
+                events.removeAll();
+            }
+            client = cli;
+            events.once(client,"close",()=>{
+                that.log("client disconnected");
+                events.removeAll();
+                client = null;
+            });
+            events.once(client,"log",function(){
+                that.log(...arguments);
+            });
         }
-    };
-}
-*/
-
-class EventTracker{
-    events = [];
-    on(target,type,listener){
-        events.push(target,type,listener);
-        target.on(type,listener);
-        return target;
+        
+        
+        this.on("close",()=>{
+            events.removeAll();
+            console.log("repl client disconnected");
+        });
     }
-    once(target,type,listener){
-        events.push(target,type,listener);
-        target.once(type,listener);
-        return target;
+    cmdreturn(val){
+        if(!this.closed)this.send("cmdreturn",val);
     }
-    removeAll(){
-        for(let [target,type,listener] of this.events){
-            target.removeListener(type,listener);
-        }
-        this.events = [];
+    log(val){
+        if(!this.closed)this.send("log",val);
     }
 };
 
 
-
-
-
-{
-    let extractCommand = function(data){
-        let arr = data.split(" ");
-        let args = arr.slice(1).join(" ");
-        let cmdname = arr[0];
-        return [cmdname,args];
-    };
-    
-    
-    const wssrepl = new ws.WebSocketServer({port:4002});
-    wssrepl.on("connection",async(ws)=>{
-        
-        //let sendLine = function(ln){
-        //}
-        
-        let client = null;
-        let events = new EventTracker;
-        const dotcmds = {
-            ".ls":()=>{
-                ws.send(createClientList()+"\n");
-            },
-            ".help":()=>{
-                ws.send(`list of available commands: ${Object.keys(dotcmds).join(" ")}\n`);
-            },
-            ".select_client":(args)=>{
-                let cid = args.trim();
-                if(cid === ""){
-                    ws.send(`Please provide the client id\n`);
-                }else if(!(cid in clients)){
-                    ws.send(`client id ${cid} not found\n`);
-                }else{
-                    setClient(clients[cid]);
-                    ws.send(`client ${cid} selected\n`);
-                }
-            },
-            ".client_info":()=>{
-                if(client !== null){
-                    ws.send(client.uagent+"\n");
-                }else{
-                    ws.send(`no client selected\n`);
-                }
-            }
-        };
-        
-        
-        
-        const setClient = function(c){
-            if(client !== null){
-                events.removeAll();
-            }
-            client = c;
-            
-            events.once(client,"disconnect",()=>{
-                ws.send(`disconnected from client ${client.uagent}\n`);
-                events.removeAll();
-                client = null;
-            });
-            events.on(client,"log",(data)=>{
-                ws.send(data+"\n");
-            });
-            events.once(ws,"close",()=>{
-                console.log("repl client disconnected\n");
-                events.removeAll();
-            });
-        }
-        
-        
-        ws.on("message",async (data)=>{
-            data = (data+"").trim();//to string
-            if(data.length === 0){
-                ws.send("> ");
-                return;
-            }
-            if(data[0] === "."){//dot command
-                const [cmdname,args] = extractCommand(data);
-                if(!(cmdname in dotcmds)){
-                    ws.send(`REPL error: unknown command ${data}\n`);
-                }else{
-                    dotcmds[cmdname](args);
-                }
-                if(client === null || client.executing === false){
-                    ws.send("> ");
-                }
-            }else if(client !== null){
-                //normal command
-                ws.send(await client.exec(data)+"\n> ");
-            }else{
-                ws.send("> ");
-            }
-        });
-    });
-}
+const wssrepl = new ws.WebSocketServer({port:4002});
+wssrepl.on("connection",async(ws)=>{
+    const repl = new ReplClient(ws);
+});
 
 
 module.exports = {
